@@ -3,17 +3,27 @@ structured JSON contract described in BRIEF.md.
 
 Coordinate contract note: we ask Gemini for its own native spatial format —
 "point": [y, x] normalized to 0-1000 — rather than raw pixel x/y on the
-image as originally spec'd in BRIEF.md. Empirically (see PROJECT NOTES /
-commit history), asking for raw pixel coordinates was unreliable: the model
-sometimes answered as if the image were a different resolution than the one
-actually sent, and a custom {"x":..,"y":..} field shape occasionally came
-back with x/y swapped depending on image size. The normalized [y, x] point
-format is what these models are actually trained to produce for spatial
-tasks, and it was consistent across every image size tested (1920x1080 down
-to 800x450) including an asymmetric real-UI target (the taskbar Start
-button). We convert it to absolute screen pixels ourselves right after
-parsing, using the *original* screenshot's dimensions — so this is also
-independent of whatever size we actually uploaded.
+image as originally spec'd in BRIEF.md. Empirically, asking for raw pixel
+coordinates was unreliable: the model sometimes answered as if the image
+were a different resolution than the one actually sent, and a custom
+{"x":..,"y":..} field shape occasionally came back with x/y swapped
+depending on image size. The normalized [y, x] point format is what these
+models are actually trained to produce for spatial tasks, and it was
+consistent across every image size tested. We convert it to absolute screen
+pixels ourselves right after parsing, using the *original* screenshot's
+dimensions.
+
+Hallucination note: even with grounded coordinates, the model will
+confidently answer from general "where things usually are" knowledge rather
+than the actual pixels in front of it — verified directly: asked to point
+at the Windows Start button in a screenshot where no taskbar was even
+visible (a maximized VS Code window), it answered with a plausible-looking
+bottom-left coordinate anyway. It also assumed the old bottom-left Start
+button convention when the real (Windows 11, default config) taskbar is
+center-aligned. The `target.visible` flag below, plus an explicit
+instruction not to guess from convention, fixed both cases in testing —
+main.py must still treat `visible: false` as "don't draw a pointer," not
+just a hint to ignore.
 """
 
 import json
@@ -24,41 +34,42 @@ from google.genai import types
 
 from . import config
 
-SYSTEM_PROMPT = """You are a screen-guide assistant helping a user complete a goal on their computer.
-You are watching their screen continuously: you'll be called again automatically each time the
-screen changes meaningfully, with no user action needed to summon you. Each call shows you the
-current screenshot and the user's goal.
+SYSTEM_PROMPT = """You guide a user through a task by watching their screen. You're called again
+automatically whenever the screen changes — no user action needed to summon you.
 
-Respond with ONLY a single JSON object, no other text, no markdown fences, matching this exact shape:
+Reply with ONLY this JSON, nothing else:
 {
-  "instruction": "short text telling the user what to do next",
-  "target": {"point": [0, 0], "label": "what the arrow points at"},
+  "instruction": "one short sentence: the very next single step",
+  "voice_description": "1-2 spoken sentences describing the same step",
+  "target": {"point": [0, 0], "label": "what it is", "visible": true},
   "offer_to_act": false,
-  "reason": "why acting would help (only when offer_to_act is true, else empty string)",
+  "reason": "",
   "action": {"type": "click", "value": ""},
   "goal_complete": false
 }
 
 Rules:
-- "target.point" is [y, x], normalized to a 0-1000 scale where [0, 0] is the top-left corner of
-  the image and [1000, 1000] is the bottom-right corner — NOT raw pixels, and independent of the
-  image's actual resolution. Point at the center of the UI element the user should interact with
-  next.
-- "instruction" is one short sentence, plain language, describing the very next single step
-  toward the goal. Never describe more than one step.
-- You will be called again automatically once the screen changes, so do not ask the user to
-  confirm they're ready — just state the next step for what's on screen right now.
-- Judge from the screenshot whether the previous instruction (see history below, if given) was
-  already carried out, and move on to the step after it. Don't repeat a step that's visibly done.
-- Set "offer_to_act" to true only when performing this one step yourself would clearly help
-  more than pointing at it (e.g. tedious typing, a fiddly precise action, or the user seems
-  stuck). Otherwise leave it false and just guide.
-- "reason" is a short, concrete, honest explanation of why acting would help. Leave it ""
-  when offer_to_act is false.
-- "action.type" is "click" or "type". "action.value" is the text to type when type, else "".
-- Set "goal_complete" to true once the screenshot shows the goal has been achieved, and point
-  "target" at whatever confirms it. Leave it false otherwise.
-Return nothing but the JSON object — no commentary, no markdown fences.
+- target.point is [y, x], normalized 0-1000 ([0,0]=top-left, [1000,1000]=bottom-right of THIS
+  image. Point at the actual pixel location of the element as it appears in this exact screenshot.
+- Ground every point in what you can literally see right now. Never infer a position from general
+  knowledge of "where things usually are" — e.g. Windows 11 often centers its taskbar instead of
+  left-aligning it, exact layouts vary by version/theme/user settings, and you cannot assume a
+  fixed spot is correct just because it commonly is elsewhere. If the target isn't actually
+  visible in this screenshot (hidden, covered by another window, off-screen, or the relevant menu
+  isn't open), set target.visible to false, point to [0, 0], and phrase "instruction" as how to
+  reveal it instead (e.g. "press the Windows key" rather than pointing at a Start button you
+  can't currently see). Never guess a plausible-looking point for something you can't see.
+- One step only, plain language. Don't ask the user to confirm readiness — you'll be called again
+  once the screen changes.
+- voice_description says the same thing as instruction, meant to be read aloud: a bit more
+  context than the on-screen text (roughly where the element is, what it looks like) so it stands
+  on its own without the card, but still just 1-2 plain sentences — not a full walkthrough.
+- If history is given below, check whether it's already done and move on to the step after it.
+- offer_to_act: true only when acting yourself clearly beats pointing (tedious typing, fiddly
+  precision, user seems stuck). reason: short and concrete; "" when offer_to_act is false.
+- action.type is "click" or "type"; action.value is the text to type, else "".
+- goal_complete: true once the screenshot shows the goal is achieved.
+No commentary, no markdown fences — the JSON object only.
 """
 
 
@@ -97,9 +108,10 @@ def _get_client():
 def understand(image, goal, history=None, window_title=None, sensitive=False):
     """Call Gemini with the screenshot + goal, return the parsed contract dict.
 
-    Returned target is {"x": <abs pixel>, "y": <abs pixel>, "label": ...},
-    already converted to absolute pixel coordinates on `image` — callers
-    don't need to know about the normalized wire format above.
+    Returned target is {"x": <abs pixel>, "y": <abs pixel>, "label": ...,
+    "visible": bool}, already converted to absolute pixel coordinates on
+    `image`. When visible is False, x/y are meaningless (0,0) — callers
+    must not draw a pointer at them, only show the instruction text.
 
     window_title: title of the currently focused window, if known — gives
     Gemini context about which app the user is actually in.
@@ -165,14 +177,19 @@ def understand(image, goal, history=None, window_title=None, sensitive=False):
     if not isinstance(point, (list, tuple)) or len(point) != 2:
         raise UnderstandError(f"Gemini response target.point malformed: {data}")
 
-    norm_y, norm_x = point
-    abs_x = (norm_x / 1000.0) * image.width
-    abs_y = (norm_y / 1000.0) * image.height
-    data["target"] = {"x": abs_x, "y": abs_y, "label": target["label"]}
+    visible = bool(target.get("visible", True))
+    if visible:
+        norm_y, norm_x = point
+        abs_x = (norm_x / 1000.0) * image.width
+        abs_y = (norm_y / 1000.0) * image.height
+    else:
+        abs_x = abs_y = 0.0
+    data["target"] = {"x": abs_x, "y": abs_y, "label": target["label"], "visible": visible}
 
     data.setdefault("reason", "")
     data.setdefault("action", {"type": "click", "value": ""})
     data.setdefault("goal_complete", False)
-    if sensitive:
-        data["offer_to_act"] = False  # enforced regardless of what Gemini returned
+    data.setdefault("voice_description", data["instruction"])
+    if sensitive or not visible:
+        data["offer_to_act"] = False  # can't act on a target we can't locate
     return data
